@@ -11,6 +11,8 @@ import pandas as pd
 import re
 import torch
 import numpy as np
+import math
+from torch.utils.data import DataLoader, TensorDataset, random_split
 
 def get_two_resp(convo):
         responses = re.split(" '[ \n]*' ", convo)
@@ -56,20 +58,6 @@ def clean(df):
 
 
 
-# Set the path to the file you'd like to load
-file_path = "test.csv"
-
-# Load the latest version
-df = kagglehub.load_dataset(
-  KaggleDatasetAdapter.PANDAS,
-  "thedevastator/dailydialog-unlock-the-conversation-potential-in",
-  file_path,
-)
-
-
-
-
-qa_dataset = clean(df)
 
 # Tokenize the data
 
@@ -163,18 +151,8 @@ def tokenize_dataset(q_a, token_map, longest_sentence):
     return tokenized_inputs
 
 
-token_map, id_map, max_tokens = load_token_dataset(qa_dataset)
-
-tokenized_dataset = tokenize_dataset(qa_dataset, token_map, max_tokens)
-
-MAX_TOKENS = max_tokens
-
-# Convert tokens to tensors
-tokenized_dataset = torch.from_numpy(tokenized_dataset)
 
 # Positional encoding - gives the model the original order of inputs
-# 
-# The next block uses code from 
 
 def get_angles(pos, i, d_model):
     angle_rates = 1 / np.power(10000, (2 * (i//2)) / np.float32(d_model))
@@ -185,11 +163,11 @@ def positional_encoding(position, d_model):
     angle_rads[:, 0::2] = np.sin(angle_rads[:, 0::2]) #for even positions using sin()
     angle_rads[:, 1::2] = np.cos(angle_rads[:, 1::2]) #for odd positions using cos()
     pos_encoding = angle_rads[np.newaxis,:]
-    return pos_encoding
+    return torch.from_numpy(pos_encoding)
 
 # Mask tokens. Any tokens beyond "END_TOKEN" will be masked
 def create_padding_mask(seq):
-    seq = torch.eq(torch.tensor([1,2,3,0,0]), 0).to(torch.int32)
+    seq = torch.eq(seq, 0).to(torch.float32)
     return seq[:, torch.newaxis, torch.newaxis, :]
 
 # Mask future tokens
@@ -197,12 +175,12 @@ def create_lookahead_mask(size):
     return torch.triu(torch.ones((size, size)), 1)
 
 def scaled_dot_product_attention(q, k, v, mask=None):
-    matmul_qk = torch.matmul(q, torch.transpose(k)) 
-    dk = np.shape(k)[-1].float()
-    scaled_attention_logits = matmul_qk / torch.sqrt(dk)
+    matmul_qk = torch.matmul(q, k.transpose(-2, -1))
+    dk = k.size(-1)
+    scaled_attention_logits = matmul_qk / math.sqrt(dk)
     if mask is not None:
         scaled_attention_logits += (mask * -1e9)  # -1e9 ~ (-INFINITY) => where ever mask is set, make its logit value close to -INF
-    attention_weights = torch.nn.softmax(scaled_attention_logits, axis=-1)  
+    attention_weights = torch.softmax(scaled_attention_logits, dim=-1)
     output = torch.matmul(attention_weights, v)  
 
     return output, attention_weights
@@ -269,10 +247,10 @@ class EncoderLayer(torch.nn.Module):
 
 class Encoder(torch.nn.Module):
     def __init__(self, num_layers, d_model, num_heads, dff, input_vocab_size, max_positional_encoding, rate=0.1):
-        super().__init__()
+        super(Encoder, self).__init__()
         self.num_layers = num_layers
         self.d_model = d_model
-        self.embedding = torch.nn.Embedding(input_vocab_size, max_positional_encoding)
+        self.embedding = torch.nn.Embedding(input_vocab_size, d_model)
         self.positional_encoding = positional_encoding(max_positional_encoding, d_model)
         self.encoder_layers = torch.nn.ModuleList([EncoderLayer(d_model, num_heads, dff, rate) for i in range(num_layers)])
         self.dropout = torch.nn.Dropout(rate)
@@ -281,8 +259,9 @@ class Encoder(torch.nn.Module):
         sequence_length = x.shape[1]
 
         x = self.embedding(x)
-        x *= torch.sqrt(self.d_model) # Done in research
-        x += self.positional_encoding[:, :sequence_length, :]
+        x *= math.sqrt(torch.tensor(self.d_model)) # Done in research
+        y = self.positional_encoding[:, :sequence_length, :]
+        x += y
         x = self.dropout(x)
 
         for i, el in enumerate(self.encoder_layers):
@@ -328,7 +307,7 @@ class Decoder(torch.nn.Module):
         super().__init__()
         self.num_layers = num_layers
         self.d_model = d_model
-        self.embedding = torch.nn.Embedding(target_vocab_size, max_positional_encoding)
+        self.embedding = torch.nn.Embedding(target_vocab_size, d_model)
         self.positional_encoding = positional_encoding(max_positional_encoding, d_model)
         self.decoder_layers = torch.nn.ModuleList([DecoderLayer(d_model, num_heads, dff, rate) for i in range(num_layers)])
         self.dropout = torch.nn.Dropout(rate)
@@ -337,7 +316,7 @@ class Decoder(torch.nn.Module):
         sequence_length = x.shape[1]
         attention_weights = {}
         x = self.embedding(x)
-        x *= torch.sqrt(self.d_model)
+        x *= math.sqrt(self.d_model)
         x += self.positional_encoding[:, :sequence_length, :]
         x = self.dropout(x)
 
@@ -363,3 +342,166 @@ class Transformer(torch.nn.Module):
         return dec_output, attn_weights
 
 
+def train_model_on_tokenized_dataset(
+    tokenized_dataset,
+    vocab_size,
+    pad_token_id=0,
+    batch_size=64,
+    epochs=5,
+    learning_rate=3e-4,
+    val_split=0.1,
+    d_model=256,
+    num_heads=8,
+    num_layers=2,
+    dff=512,
+    dropout=0.1,
+):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    src = tokenized_dataset[:, 0, :].long()
+    tgt_full = tokenized_dataset[:, 1, :].long()
+    tgt_in = tgt_full[:, :-1]
+    tgt_out = tgt_full[:, 1:]
+
+    dataset = TensorDataset(src, tgt_in, tgt_out)
+    val_size = int(len(dataset) * val_split)
+    train_size = len(dataset) - val_size
+    train_ds, val_ds = random_split(dataset, [train_size, val_size])
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False) if val_size > 0 else None
+
+    model = Transformer(
+        input_vocab_size=vocab_size,
+        target_vocab_size=vocab_size,
+        pe_input=src.size(1),
+        pe_target=tgt_in.size(1),
+        d_model=d_model,
+        num_heads=num_heads,
+        num_layers=num_layers,
+        dff=dff,
+        rate=dropout,
+    ).to(device)
+
+    criterion = torch.nn.CrossEntropyLoss(ignore_index=pad_token_id)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, betas=(0.9, 0.98), eps=1e-9)
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        total_train_loss = 0.0
+
+        for batch_src, batch_tgt_in, batch_tgt_out in train_loader:
+            batch_src = batch_src.to(device)
+            batch_tgt_in = batch_tgt_in.to(device)
+            batch_tgt_out = batch_tgt_out.to(device)
+
+            enc_padding_mask = create_padding_mask(batch_src).to(device)
+            dec_padding_mask = create_padding_mask(batch_src).to(device)
+            look_ahead_mask = create_lookahead_mask(batch_tgt_in.size(1)).to(device)
+            dec_target_padding_mask = create_padding_mask(batch_tgt_in).to(device)
+            combined_mask = torch.maximum(
+                dec_target_padding_mask,
+                look_ahead_mask.unsqueeze(0).unsqueeze(0),
+            )
+
+            optimizer.zero_grad()
+            logits, _ = model(
+                inp=batch_src,
+                tar=batch_tgt_in,
+                enc_padding_mask=enc_padding_mask,
+                look_ahead_mask=combined_mask,
+                dec_padding_mask=dec_padding_mask,
+            )
+
+            loss = criterion(logits.reshape(-1, vocab_size), batch_tgt_out.reshape(-1))
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            total_train_loss += loss.item()
+
+        avg_train_loss = total_train_loss / max(1, len(train_loader))
+
+        if val_loader is not None:
+            model.eval()
+            total_val_loss = 0.0
+            with torch.no_grad():
+                for batch_src, batch_tgt_in, batch_tgt_out in val_loader:
+                    batch_src = batch_src.to(device)
+                    batch_tgt_in = batch_tgt_in.to(device)
+                    batch_tgt_out = batch_tgt_out.to(device)
+
+                    enc_padding_mask = create_padding_mask(batch_src).to(device)
+                    dec_padding_mask = create_padding_mask(batch_src).to(device)
+                    look_ahead_mask = create_lookahead_mask(batch_tgt_in.size(1)).to(device)
+                    dec_target_padding_mask = create_padding_mask(batch_tgt_in).to(device)
+                    combined_mask = torch.maximum(
+                        dec_target_padding_mask,
+                        look_ahead_mask.unsqueeze(0).unsqueeze(0),
+                    )
+
+                    logits, _ = model(
+                        inp=batch_src,
+                        tar=batch_tgt_in,
+                        enc_padding_mask=enc_padding_mask,
+                        look_ahead_mask=combined_mask,
+                        dec_padding_mask=dec_padding_mask,
+                    )
+                    loss = criterion(logits.reshape(-1, vocab_size), batch_tgt_out.reshape(-1))
+                    total_val_loss += loss.item()
+
+            avg_val_loss = total_val_loss / max(1, len(val_loader))
+            print(f"Epoch {epoch}/{epochs} | train_loss={avg_train_loss:.4f} | val_loss={avg_val_loss:.4f}")
+        else:
+            print(f"Epoch {epoch}/{epochs} | train_loss={avg_train_loss:.4f}")
+
+    return model
+
+
+if __name__ == "__main__":
+
+    # Set the path to the file you'd like to load
+    file_path = "test.csv"
+
+    # Load the latest version
+    df = kagglehub.load_dataset(
+    KaggleDatasetAdapter.PANDAS,
+    "thedevastator/dailydialog-unlock-the-conversation-potential-in",
+    file_path,
+    )
+
+    qa_dataset = clean(df)
+
+    token_map, id_map, max_tokens = load_token_dataset(qa_dataset)
+
+    tokenized_dataset = tokenize_dataset(qa_dataset, token_map, max_tokens)
+
+    MAX_TOKENS = max_tokens
+
+    # Convert tokens to tensors
+    tokenized_dataset = torch.from_numpy(tokenized_dataset)
+
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    num_layers = 2
+    d_model = 256
+    dff = 512
+    num_heads = 8
+    dropout_rate = 0.1
+    batch_size = 64
+    epochs = 1
+    learning_rate = 3e-4
+
+    model = train_model_on_tokenized_dataset(
+        tokenized_dataset=tokenized_dataset,
+        vocab_size=len(id_map),
+        pad_token_id=token_map["PAD"],
+        batch_size=batch_size,
+        epochs=epochs,
+        learning_rate=learning_rate,
+        d_model=d_model,
+        num_heads=num_heads,
+        num_layers=num_layers,
+        dff=dff,
+        dropout=dropout_rate,
+    )
