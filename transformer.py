@@ -322,8 +322,8 @@ class Decoder(torch.nn.Module):
 
         for i, dl in enumerate(self.decoder_layers):
             x, attn_weights_block1, attn_weights_block2 = dl(x, encoding_output, look_ahead_mask, padding_mask)
-            attention_weights[['decoder_layer{}_block1'.format(i+1)]] = attn_weights_block1
-            attention_weights[['decoder_layer{}_block2'.format(i+1)]] = attn_weights_block2
+            attention_weights['decoder_layer{}_block1'.format(i+1)] = attn_weights_block1
+            attention_weights['decoder_layer{}_block2'.format(i+1)] = attn_weights_block2
         
         return x, attention_weights
 
